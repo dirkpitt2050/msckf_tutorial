@@ -508,6 +508,17 @@ class FeatureTracker():
 
         return np.squeeze(detected_corners)
 
+    def track_map(self, points):
+        """Allocate ids for image keypoints (already detected) corresponding to map points
+        """
+        id_start = self.id_counter
+        num_keypoints = len(points)
+        id_end = self.id_counter + num_keypoints
+        self.prev_ids = np.arange(id_start, id_end)
+        self.id_counter += num_keypoints + 1
+        self.prev_keypoints = points.reshape(-1,1,2)    # OpenCV requires another dimension (channel)
+        return True
+
     def track(self, img, imu_measurements=[]):
         """Track and detect new keypoints in the new image.
 

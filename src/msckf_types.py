@@ -80,3 +80,14 @@ class FeatureTrack():
 
         self.has_triangulated_pt = False
         self.triangulated_pt = None
+
+
+class MappedLandmark():
+    def __init__(self, id, keypoint, global_point, camera_id):
+        self.id = id
+        self.tracked_keypoints = []
+        self.camera_ids = []
+        self.tracked_keypoints.append(keypoint)
+        self.camera_ids.append(camera_id)
+
+        self.global_pt = global_point

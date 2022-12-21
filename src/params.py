@@ -191,3 +191,15 @@ class EurocDatasetCalibrationParams():
     cam0_distortion_coeffs = np.array([-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05])
     cam0_intrinsics = np.array([458.654, 457.296, 367.215, 248.375])
     cam0_resolution = np.array([752, 480])
+
+
+@dataclass()
+class LanderDatasetCalibrationParams():
+    T_imu_cam0 = np.array([[1.0, 0.0, 0.0, 0.0],
+                           [0.0, 1.0, 0.0, 0.0],
+                           [0.0, 0.0, 1.0, 0.0],
+                           [0.0, 0.0, 0.0, 1.0]])
+    cam0_distortion_model = 'radtan'
+    cam0_distortion_coeffs = np.zeros((1,4))
+    cam0_intrinsics = np.array([3059.59135458973, 3059.59135458973, 512.0, 512.0])
+    cam0_resolution = np.array([1024, 1024])

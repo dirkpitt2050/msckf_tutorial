@@ -44,5 +44,5 @@ scripts/\.vs/scripts/v15/\.suo
 *.zip
 *.dir
 *.pyproj
-*.csv
 *.pt
+.DS_Store

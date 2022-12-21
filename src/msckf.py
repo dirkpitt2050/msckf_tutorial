@@ -10,7 +10,7 @@ from scipy.stats import chi2
 
 from jpl_quat_ops import JPLQuaternion, jpl_error_quat, jpl_omega
 from math_utilities import normalize, skew_matrix, symmeterize_matrix
-from msckf_types import FeatureTrack
+from msckf_types import FeatureTrack, MappedLandmark
 from params import AlgorithmConfig
 from spatial_transformations import JPLPose
 from triangulation import linear_triangulate, optimize_point_location
@@ -161,6 +161,7 @@ class MSCKF():
         self.params = params
         self.imu_buffer = []
         self.map_id_to_feature_tracks = {}
+        self.map_id_to_ml = {}
         self.camera_id = 0
         self.camera_calib = camera_calibration
         self.gravity = np.array([0, 0, -9.81])
@@ -234,6 +235,40 @@ class MSCKF():
     def propogate_and_update_msckf(self, imu_buffer, feature_ids, normalized_keypoints):
         pass
 
+    def remove_old_clones_ml(self):
+        num_clones = self.state.num_clones()
+
+        # If we have yet to reach the maximum number of camera clones then skip
+#        if num_clones < self.params.max_clone_num:
+        if num_clones < 2:
+            return
+
+        # Remove the oldest
+        ids_to_remove = []
+        oldest_camera_id = list(self.state.clones.keys())[0]
+
+        # Run the MSCKF update on any features which have this clone
+        for id, ml in self.map_id_to_ml.items():
+            ml_cam_id = ml.camera_ids[0]
+            if ml_cam_id == oldest_camera_id:
+                ids_to_remove.append(id)
+
+        self.msckf_update_ml(ids_to_remove)
+
+        # Remove the clone from the state vector
+
+        # Since it is the oldest it is the first clone within our covariance matrix.
+        clone_start_index = StateInfo.CLONE_START_INDEX
+        clone_end_index = clone_start_index + StateInfo.CLONE_STATE_SIZE
+        s = slice(clone_start_index, clone_end_index)
+
+        new_cov = np.delete(self.state.covariance, s, axis=0)
+        new_cov = np.delete(new_cov, s, axis=1)
+        assert (new_cov.shape[0] == new_cov.shape[1])
+        self.state.covariance = new_cov
+
+        del self.state.clones[oldest_camera_id]
+
     def remove_old_clones(self):
         """Remove old camera clones from the state vector.
 
@@ -274,6 +309,31 @@ class MSCKF():
         self.state.covariance = new_cov
 
         del self.state.clones[oldest_camera_id]
+
+    def add_ml_features(self, feature_ids, normalized_keypoints, global_points):
+        mature_feature_ids = []
+        newest_clone_id = self.augment_camera_state(0)
+        for i, id in enumerate(feature_ids):
+            keypoint = normalized_keypoints[i, :]
+            point = global_points[i, :]
+            if id not in self.map_id_to_ml:
+                ml = MappedLandmark(id, keypoint, point, newest_clone_id)
+                self.map_id_to_ml[id] = ml
+                continue
+
+            ml = self.map_id_to_ml[id]
+            ml.tracked_keypoints.append(keypoint)
+            ml.camera_ids.append(newest_clone_id)
+            mature_feature_ids.append(id)
+
+
+        lost_feature_ids = []
+        for id, ml in self.map_id_to_ml.items():
+            if ml.camera_ids[-1] != newest_clone_id:
+                lost_feature_ids.append(id)
+
+        ids_to_update = mature_feature_ids + lost_feature_ids
+        self.msckf_update_ml(ids_to_update)
 
     def add_camera_features(self, feature_ids, normalized_keypoints):
         """
@@ -355,6 +415,25 @@ class MSCKF():
                     return True
             return False
 
+    def msckf_update_ml(self, ids):
+        if len(ids) == 0:
+            return
+        for id in ids:
+            ml = self.map_id_to_ml[id]
+
+            camera_JPLPose_world_list = []
+            for cam_id in ml.camera_ids:
+                clone = self.state.clones[cam_id]
+                #assert (clone.camera_id == track.camera_ids[idx])
+                camera_JPLPose_world_list.append(clone.camera_JPLPose_global)
+
+        logger.info("Updating with %i mapped landmarks", len(ids))
+
+        self.update_with_ids_ml()
+
+        for id in ids:
+            del self.map_id_to_ml[id]
+
     def msckf_update(self, ids):
         """Starts the msckf update process given a list of features.
 
@@ -410,6 +489,77 @@ class MSCKF():
 
         for id in ids:
             del self.map_id_to_feature_tracks[id]
+
+    def compute_residual_and_jacobian_ml(self, ml):
+        pt_global = ml.global_pt
+#        num_measurements = 1
+        num_measurements = len(ml.tracked_keypoints)
+
+        # Preallocate our matrices. Note that the number of measurements can end up being smaller
+        # if one of the measurements corresponds to a invalid clone(was removed during pruning)
+        H_X = np.zeros((2 * num_measurements, self.state.get_state_size()), dtype=np.float64)
+        residuals = np.empty((2 * num_measurements, ), dtype=np.float64)
+
+        actual_measurement_count = 0
+        last_cam_id = -1
+        for idx in range(num_measurements):
+            cam_id = ml.camera_ids[idx]
+            measurement = ml.tracked_keypoints[idx]
+            clone = None
+            clone_index = None
+            # We need to iterate through the OrderedDict rather than use the key as we need to find the
+            # index within the state vector
+            for index, (key, value) in enumerate(self.state.clones.items()):
+                if key == cam_id:
+                    clone = value
+                    clone_index = index
+            # Clone doesn't exist/ was removed. Skip this measurement
+            if clone_index == None:
+                continue
+            clone = self.state.clones[cam_id]
+            camera_R_global = clone.camera_JPLPose_global.q.rotation_matrix()
+            camera_t_global = camera_R_global @ -clone.camera_JPLPose_global.t
+
+            pt_camera = camera_R_global @ pt_global + camera_t_global
+            # The actual measurement index. Needed if one of the camera clones is invalid.
+            m_idx = actual_measurement_count
+            # This slice corresponds to the rows that relate to this measurement.
+            measurement_slice = slice(2 * m_idx, 2 * m_idx + 2)
+            #Compute and set the residuals
+            normalized_x = pt_camera[0] / pt_camera[2]
+            normalized_y = pt_camera[1] / pt_camera[2]
+            error = np.array([measurement[0] - normalized_x, measurement[1] - normalized_y])
+
+            residuals[measurement_slice] = error
+
+            X = pt_camera[0]
+            Y = pt_camera[1]
+            invZ = 1.0 / pt_camera[2]
+            jac_i = invZ * np.array([[1.0, 0.0, -X * invZ], [0.0, 1.0, -Y * invZ]])
+
+            # Compute jacobian with respect to the current camera clone
+            # Eq 22 in the tech report
+            jac_attitude = jac_i @ skew_matrix(pt_camera)
+            jac_position = -jac_i @ camera_R_global
+
+            # Get the index of the current clone within the state vector. As we need to set their computed jacobians
+            clone_state_index = self.state.calc_clone_index(clone_index)
+
+            att_start_index = clone_state_index + StateInfo.CLONE_ATT_SLICE.start
+            att_end_index = clone_state_index + StateInfo.CLONE_ATT_SLICE.stop
+            # Reads as the partial derivatives(jacobians) of the measurement with respect to the clone attitude.
+            H_X[measurement_slice, att_start_index:att_end_index] = jac_attitude
+
+            pos_start_index = clone_state_index + StateInfo.CLONE_POS_SLICE.start
+            pos_end_index = clone_state_index + StateInfo.CLONE_POS_SLICE.stop
+            H_X[measurement_slice, pos_start_index:pos_end_index] = jac_position
+
+            actual_measurement_count += 1
+
+        if actual_measurement_count != num_measurements:
+            assert (False)
+
+        return actual_measurement_count, residuals, H_X
 
     def compute_residual_and_jacobian(self, track, pt_global):
         """
@@ -530,6 +680,51 @@ class MSCKF():
         if gamma < self.chi_square_val[dof]:
             return True
         return False
+
+    def update_with_ids_ml(self):
+        num_landmarks = len(self.map_id_to_ml)
+
+        if num_landmarks == 0:
+            return
+
+        # Here we preallocate our update matrices. This way we can do 1 big EKF update
+        # rather then many small ones(is much more efficient).
+        # This is the maximum size possible of our update matrix. Each feature provides 2
+        # residuals per keypoint * the maximum number of keypoints(max_track_length).
+        max_possible_size = num_landmarks * 2 * 1
+        H = np.empty((max_possible_size, self.state.get_state_size()))
+        r = np.zeros((max_possible_size, ))
+        index = 0
+        for id, ml in self.map_id_to_ml.items():
+            actual_num_measurements, residuals, H_X = self.compute_residual_and_jacobian_ml(ml)
+
+            H_o = H_X
+
+            rows, cols = H_o.shape
+            assert (rows == 2 * actual_num_measurements)
+            assert (cols == H_X.shape[1])
+
+            r_o = residuals
+
+#            dof = residuals.shape[0] / 2 - 1
+#            if not self.chi_square_test(H_o, r_o, dof):
+#                continue
+
+            num_residuals = residuals.shape[0]
+            start_row = index
+            end = index + num_residuals
+            r[start_row:end] = r_o
+            H[start_row:end] = H_o
+            index += num_residuals
+
+        if index == 0:
+            return
+        final_r = r[0:index]
+        final_H = H[0:index]
+
+        R = np.zeros((final_r.shape[0], final_r.shape[0]))
+        np.fill_diagonal(R, self.params.keypoint_noise_sigma**2)
+        self.update_EKF(final_r, final_H, R)
 
     def update_with_good_ids(self, map_good_track_ids_to_point_3d):
         """ Run an EKF update with valid tracks.
@@ -678,6 +873,9 @@ class MSCKF():
             self.integrate(imu)
 
             Phi = None
+            Fdt = None
+            Fdt2 = None
+            Fdt3 = None
             transition_method = AlgorithmConfig.MSCKFParams.StateTransitionIntegrationMethod
             if self.params.state_transition_integration == transition_method.Euler:
                 Phi = np.eye(15) + F * imu.time_interval
@@ -706,6 +904,12 @@ class MSCKF():
 
             new_cov_symmetric = symmeterize_matrix(new_covariance)
             self.state.covariance[0:StateInfo.IMU_STATE_SIZE, 0:StateInfo.IMU_STATE_SIZE] = new_cov_symmetric
+#            print(np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                                StateInfo.POS_SLICE][0,0]),
+#                  np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                                StateInfo.POS_SLICE][1,1]),
+#                  np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                                StateInfo.POS_SLICE][2,2]))
 
     def update_EKF(self, res, H, R):
         """
@@ -763,6 +967,17 @@ class MSCKF():
         # Apply the new covariance and the update
         self.state.covariance = new_cov
         self.state.update_state(delta_x)
+
+        logger.info('pos_residual = [%f, %f, %f]',
+                    delta_x[StateInfo.POS_SLICE][0],
+                    delta_x[StateInfo.POS_SLICE][1],
+                    delta_x[StateInfo.POS_SLICE][2])
+#        print(np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                            StateInfo.POS_SLICE][0,0]),
+#              np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                            StateInfo.POS_SLICE][1,1]),
+#              np.sqrt(self.state.covariance[StateInfo.POS_SLICE,
+#                                            StateInfo.POS_SLICE][2,2]))
 
     def augment_camera_state(self, timestamp):
         imu_R_global = self.state.imu_JPLQ_global.rotation_matrix()
